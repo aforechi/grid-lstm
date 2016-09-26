@@ -204,6 +204,7 @@ function feval(x)
         params:copy(x)
     end
     grad_params:zero()
+    protos.rnn:forget()
 
     ------------------ get minibatch -------------------
     local x, y = loader:next_batch(1)
@@ -224,6 +225,8 @@ function feval(x)
         doutput_t = protos.criterion:backward(predictions[t], y[t])
         protos.rnn:backward( x[t], doutput_t )
     end
+
+
     grad_params:clamp(-opt.grad_clip, opt.grad_clip)
     return loss, grad_params
 end
