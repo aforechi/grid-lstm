@@ -3,11 +3,11 @@
 
 This file trains a character-level multi-layer RNN on text data
 
-Code is based on implementation in 
+Code is based on implementation in
 https://github.com/oxford-cs-ml-2015/practical6
 but modified to have multi-layer support, GPU support, as well as
 many other common model/optimization bells and whistles.
-The practical6 code is in turn based on 
+The practical6 code is in turn based on
 https://github.com/wojciechz/learning_to_execute
 which is turn based on other stuff in Torch, etc... (long lineage)
 
@@ -19,15 +19,12 @@ require 'nngraph'
 require 'optim'
 require 'lfs'
 require 'cudnn'
+require 'rnn'
 
 require 'util.OneHot'
 require 'util.misc'
 local CharSplitLMMinibatchLoader = require 'util.CharSplitLMMinibatchLoader'
 local model_utils = require 'util.model_utils'
-local LSTM = require 'model.LSTM'
-local GridLSTM = require 'model.GridLSTM'
-local GRU = require 'model.GRU'
-local RNN = require 'model.RNN'
 
 cmd = torch.CmdLine()
 cmd:text()
@@ -42,7 +39,6 @@ cmd:option('-digit_length', 4, 'length of the digits to add for the addition tas
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
-cmd:option('-model', 'lstm', 'lstm, grid_lstm, gru, or rnn')
 cmd:option('-tie_weights', 1, 'tie grid lstm weights?')
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
@@ -75,7 +71,7 @@ opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
 -- train / val / test split for data, in fractions
 local test_frac = math.max(0, 1 - (opt.train_frac + opt.val_frac))
-local split_sizes = {opt.train_frac, opt.val_frac, test_frac} 
+local split_sizes = {opt.train_frac, opt.val_frac, test_frac}
 
 -- initialize cunn/cutorch for training on the GPU and fall back to CPU gracefully
 if opt.gpuid >= 0 and opt.opencl == 0 then
@@ -148,38 +144,19 @@ if string.len(opt.init_from) > 0 then
     opt.model = checkpoint.opt.model
     do_random_init = false
 else
-    print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
+    print('creating model with ' .. opt.num_layers .. ' layers')
     protos = {}
-    if opt.model == 'lstm' then
-        protos.rnn = LSTM.lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    elseif opt.model == 'grid_lstm' then
-        protos.rnn = GridLSTM.grid_lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights)
-    elseif opt.model == 'gru' then
-        protos.rnn = GRU.gru(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    elseif opt.model == 'rnn' then
-        protos.rnn = RNN.rnn(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
-    end
-    protos.criterion = nn.ClassNLLCriterion()
-end
 
--- the initial state of the cell/hidden states
-init_state = {}
-for L=1,opt.num_layers do
-    local h_init = torch.zeros(opt.batch_size, opt.rnn_size)
-    if opt.gpuid >=0 and opt.opencl == 0 then h_init = h_init:cuda() end
-    if opt.gpuid >=0 and opt.opencl == 1 then h_init = h_init:cl() end
-    table.insert(init_state, h_init:clone())
-    if opt.model == 'lstm' or opt.model == 'grid_lstm' then
-        table.insert(init_state, h_init:clone()) -- extra initial state for prev_c
-    end
-end
-
--- ship the model to the GPU if desired
-if opt.gpuid >= 0 and opt.opencl == 0 then
-    for k,v in pairs(protos) do v:cuda() end
-end
-if opt.gpuid >= 0 and opt.opencl == 1 then
-    for k,v in pairs(protos) do v:cl() end
+    local inputs = {}
+    table.insert(inputs, nn.Identity()())
+    local top_h = nn.Grid2DLSTM(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights)(inputs)
+    if opt.dropout > 0 then top_h = nn.Dropout(self.dropout)(top_h) end
+    local proj = nn.Linear(opt.rnn_size, vocab_size)(top_h):annotate{name='decoder'}
+    local logsoft = nn.LogSoftMax()(proj)
+    local outputs = {}
+    table.insert(outputs, logsoft)
+    protos.rnn = nn.gModule(inputs, outputs):cuda()
+    protos.criterion = nn.ClassNLLCriterion():cuda()
 end
 
 -- put the above things into one flattened parameters tensor
@@ -190,25 +167,18 @@ if do_random_init then
     params:uniform(-0.08, 0.08) -- small uniform numbers
 end
 -- initialize the LSTM forget gates with slightly higher biases to encourage remembering in the beginning
-if opt.model == 'lstm' or opt.model == 'grid_lstm' then
-    for layer_idx = 1, opt.num_layers do
-        for _,node in ipairs(protos.rnn.forwardnodes) do
-            if node.data.annotations.name == "i2h_" .. layer_idx then
-                print('setting forget gate biases to 1 in LSTM layer ' .. layer_idx)
-                -- the gates are, in order, i,f,o,g, so f is the 2nd block of weights
-                node.data.module.bias[{{opt.rnn_size+1, 2*opt.rnn_size}}]:fill(1.0)
-            end
+for layer_idx = 1, opt.num_layers do
+    for _,node in ipairs(protos.rnn.forwardnodes) do
+        if node.data.annotations.name == "i2h_" .. layer_idx then
+            print('setting forget gate biases to 1 in LSTM layer ' .. layer_idx)
+            -- the gates are, in order, i,f,o,g, so f is the 2nd block of weights
+            node.data.module.bias[{{opt.rnn_size+1, 2*opt.rnn_size}}]:fill(1.0)
         end
     end
 end
 
 print('number of parameters in the model: ' .. params:nElement())
--- make a bunch of clones after flattening, as that reallocates memory
-clones = {}
-for name,proto in pairs(protos) do
-    print('cloning ' .. name)
-    clones[name] = model_utils.clone_many_times(proto, opt.seq_length, not proto.parameters)
-end
+
 
 -- preprocessing helper function
 function prepro(x,y)
@@ -226,78 +196,9 @@ function prepro(x,y)
     return x,y
 end
 
-function get_input_mem_cell()
-    local input_mem_cell = torch.zeros(opt.batch_size, opt.rnn_size)
-    if opt.gpuid >= 0 and opt.opencl == 0 then
-      input_mem_cell = input_mem_cell:float():cuda()
-    end
-    return input_mem_cell
-end
-
-function get_zeroed_d_output_t(vocab_size)
-    local zeroed_d_output_t = torch.zeros(opt.batch_size, vocab_size)
-    if opt.gpuid >= 0 and opt.opencl == 0 then
-      zeroed_d_output_t = zeroed_d_output_t:float():cuda()
-    end
-    return zeroed_d_output_t
-end
-
--- evaluate the loss over an entire split
-function eval_split(split_index, max_batches)
-    print('evaluating loss over split index ' .. split_index)
-    local n = loader.split_sizes[split_index]
-    if max_batches ~= nil then n = math.min(max_batches, n) end
-
-    loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
-    local loss = 0
-    local accy = 0
-    local normal = 0
-    local rnn_state = {[0] = init_state}
-
-    for i = 1,n do -- iterate over batches in the split
-        -- fetch a batch
-        local x, y = loader:next_batch(split_index)
-        x,y = prepro(x,y)
-        -- forward pass
-        for t=1,opt.seq_length do
-            clones.rnn[t]:evaluate() -- for dropout proper functioning
-            if opt.model == "grid_lstm" then
-              local input_mem_cell = get_input_mem_cell()
-              rnn_inputs = {input_mem_cell, x[t], unpack(rnn_state[t-1])} -- if we're using a grid lstm, hand in a zero vec for the starting memory cell state
-            else
-              rnn_inputs = {x[t], unpack(rnn_state[t-1])}
-            end
-            local lst = clones.rnn[t]:forward(rnn_inputs)
-            rnn_state[t] = {}
-            for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
-            prediction = lst[#lst]
-
-            local target_delimiter_position = opt.seq_length - (opt.digit_length + 2)
-            if opt.task == "addition" and t > target_delimiter_position then
-                max, pred_argmax = torch.max(prediction,2)
-                accy = accy + torch.eq(pred_argmax, y[t]):sum()
-                normal = normal + prediction:size(1)
-            end
-
-            loss = loss + clones.criterion[t]:forward(prediction, y[t])
-        end
-        -- carry over lstm state
-        rnn_state[0] = rnn_state[#rnn_state]
-        print(i .. '/' .. n .. '...')
-    end
-
-    local out
-    if opt.task == "addition" then
-        out = accy / normal
-    else 
-        out = loss / opt.seq_length / n
-    end
-
-    return out
-end
 
 -- do fwd/bwd and return loss, grad_params
-local init_state_global = clone_list(init_state)
+-- local init_state_global = clone_list(init_state)
 function feval(x)
     if x ~= params then
         params:copy(x)
@@ -311,57 +212,18 @@ function feval(x)
     local rnn_state = {[0] = init_state_global}
     local predictions = {}           -- softmax outputs
     local loss = 0
+    protos.rnn:training()
     for t=1,opt.seq_length do
-        clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
-        local rnn_inputs
-        if opt.model == "grid_lstm" then
-          local input_mem_cell = get_input_mem_cell()
-          rnn_inputs = {input_mem_cell, x[t], unpack(rnn_state[t-1])} -- if we're using a grid lstm, hand in a zero vec for the starting memory cell state
-        else
-          rnn_inputs = {x[t], unpack(rnn_state[t-1])}
-        end
-        local lst = clones.rnn[t]:forward(rnn_inputs)
-        rnn_state[t] = {}
-        for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
-        predictions[t] = lst[#lst] -- last element is the prediction
-        loss = loss + clones.criterion[t]:forward(predictions[t], y[t])
+      predictions[t] = protos.rnn:forward(x[t])
+      loss = loss + protos.criterion:forward(predictions[t], y[t])
     end
     loss = loss / opt.seq_length
 
     ------------------ backward pass -------------------
-    -- initialize gradient at time t to be zeros (there's no influence from future)
-    local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
     for t=opt.seq_length,1,-1 do
-
-        -- If we're doing the addition task and we're at t < position of target delimiter, just use a vec of zeros for dL/dOutput
-        -- We don't want to suffer prediction loss prior to the target delimiter, just recurrence loss.
-        local target_delimiter_position = opt.seq_length - (opt.digit_length + 2)
-        if opt.task == "addition" and t < target_delimiter_position then
-            doutput_t = get_zeroed_d_output_t(loader.vocab_size)
-        else
-            doutput_t = clones.criterion[t]:backward(predictions[t], y[t])
-        end
-
-        -- backprop through loss, and softmax/linear
-        table.insert(drnn_state[t], doutput_t) -- drnn_state[t] already has dL/dH_t+1 vectors for every layer; just adding the dL/dOutput to the list. 
-
-        local dlst = clones.rnn[t]:backward(rnn_inputs, drnn_state[t]) -- <- right here, you're appending the doutput_t to the list of dLdh for all layers, then using that big list to backprop into the input and unpacked rnn state vecs at t-1
-        drnn_state[t-1] = {}
-        local skip_index
-        if opt.model == "grid_lstm" then skip_index = 2 else skip_index = 1 end
-        for k,v in pairs(dlst) do
-            if k > skip_index then -- k <= skip_index is gradient on inputs, which we dont need
-                -- note we do k-1 because first item is dembeddings, and then follow the 
-                -- derivatives of the state, starting at index 2. I know...
-                drnn_state[t-1][k-skip_index] = v
-            end
-        end
+        doutput_t = protos.criterion:backward(predictions[t], y[t])
+        protos.rnn:backward( x[t], doutput_t )
     end
-    ------------------------ misc ----------------------
-    -- transfer final state to initial state (BPTT)
-    init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
-    -- grad_params:div(opt.seq_length) -- this line should be here but since we use rmsprop it would have no effect. Removing for efficiency
-    -- clip gradient element-wise
     grad_params:clamp(-opt.grad_clip, opt.grad_clip)
     return loss, grad_params
 end
@@ -387,7 +249,7 @@ for i = 1, iterations do
         cutorch.synchronize()
     end
     local time = timer:time().real
-    
+
     local train_loss = loss[1] -- the loss is inside a list, pop it
     train_losses[i] = train_loss
 
@@ -423,7 +285,7 @@ for i = 1, iterations do
     if i % opt.print_every == 0 then
         print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.4fs", i, iterations, epoch, train_loss, grad_params:norm() / params:norm(), time))
     end
-   
+
     if i % 10 == 0 then collectgarbage() end
 
     -- handle early stopping if things are going really bad
@@ -437,5 +299,3 @@ for i = 1, iterations do
         break -- halt
     end
 end
-
-
