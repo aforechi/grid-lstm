@@ -149,32 +149,23 @@ else
 
     local inputs = {}
     table.insert(inputs, nn.Identity()())
-    local top_h = nn.Grid2DLSTM(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights)(inputs)
-    if opt.dropout > 0 then top_h = nn.Dropout(self.dropout)(top_h) end
+    local top_h = nn.Grid2DLSTM(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights, opt.seq_length)(inputs)
+    if opt.dropout > 0 then top_h = nn.Dropout(opt.dropout)(top_h) end
     local proj = nn.Linear(opt.rnn_size, vocab_size)(top_h):annotate{name='decoder'}
     local logsoft = nn.LogSoftMax()(proj)
     local outputs = {}
     table.insert(outputs, logsoft)
-    protos.rnn = nn.gModule(inputs, outputs):cuda()
+    protos.rnn = nn.Recursor(nn.gModule(inputs, outputs)):cuda()
+
     protos.criterion = nn.ClassNLLCriterion():cuda()
 end
 
 -- put the above things into one flattened parameters tensor
 params, grad_params = model_utils.combine_all_parameters(protos.rnn)
 
--- initialization
+-- -- initialization
 if do_random_init then
     params:uniform(-0.08, 0.08) -- small uniform numbers
-end
--- initialize the LSTM forget gates with slightly higher biases to encourage remembering in the beginning
-for layer_idx = 1, opt.num_layers do
-    for _,node in ipairs(protos.rnn.forwardnodes) do
-        if node.data.annotations.name == "i2h_" .. layer_idx then
-            print('setting forget gate biases to 1 in LSTM layer ' .. layer_idx)
-            -- the gates are, in order, i,f,o,g, so f is the 2nd block of weights
-            node.data.module.bias[{{opt.rnn_size+1, 2*opt.rnn_size}}]:fill(1.0)
-        end
-    end
 end
 
 print('number of parameters in the model: ' .. params:nElement())
@@ -197,8 +188,18 @@ function prepro(x,y)
 end
 
 
+init_state = {}
+for L=1,opt.num_layers do
+    local h_init = torch.zeros(opt.batch_size, opt.rnn_size):cuda()
+    table.insert(init_state, h_init:clone())
+    table.insert(init_state, h_init:clone()) -- extra initial state for prev_c
+end
+local init_state_global = clone_list(init_state)
+
+
 -- do fwd/bwd and return loss, grad_params
--- local init_state_global = clone_list(init_state)
+local gridlstm = protos.rnn:findModules('nn.Grid2DLSTM')[1]
+
 function feval(x)
     if x ~= params then
         params:copy(x)
@@ -210,7 +211,7 @@ function feval(x)
     local x, y = loader:next_batch(1)
     x,y = prepro(x,y)
     ------------------- forward pass -------------------
-    local rnn_state = {[0] = init_state_global}
+    gridlstm.cells = {[0] = init_state_global}
     local predictions = {}           -- softmax outputs
     local loss = 0
     protos.rnn:training()
@@ -226,7 +227,7 @@ function feval(x)
         protos.rnn:backward( x[t], doutput_t )
     end
 
-
+    init_state_global = gridlstm.cells[#gridlstm.cells]
     grad_params:clamp(-opt.grad_clip, opt.grad_clip)
     return loss, grad_params
 end
