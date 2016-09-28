@@ -149,7 +149,8 @@ else
 
     local inputs = {}
     table.insert(inputs, nn.Identity()())
-    local top_h = nn.Grid2DLSTM(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights, opt.seq_length)(inputs)
+    local embedded = nn.LookupTable(vocab_size, opt.rnn_size)(inputs) -- We map a char into hidden space via a lookup table
+    local top_h = nn.Grid2DLSTM(opt.rnn_size, opt.num_layers, opt.dropout, opt.tie_weights, opt.seq_length)(embedded)
     if opt.dropout > 0 then top_h = nn.Dropout(opt.dropout)(top_h) end
     local proj = nn.Linear(opt.rnn_size, vocab_size)(top_h):annotate{name='decoder'}
     local logsoft = nn.LogSoftMax()(proj)
