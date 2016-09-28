@@ -204,7 +204,7 @@ function feval(x)
     local x, y = loader:next_batch(1)
     x,y = prepro(x,y)
     ------------------- forward pass -------------------
-    if init_state_global then gridlstm.cells = {[0] = init_state_global} end
+    if init_state_global then gridlstm.userPrevCell = init_state_global end
     local predictions = {}           -- softmax outputs
     local loss = 0
     protos.rnn:training()
