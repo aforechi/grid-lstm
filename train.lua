@@ -188,17 +188,9 @@ function prepro(x,y)
 end
 
 
-init_state = {}
-for L=1,opt.num_layers do
-    local h_init = torch.zeros(opt.batch_size, opt.rnn_size):cuda()
-    table.insert(init_state, h_init:clone())
-    table.insert(init_state, h_init:clone()) -- extra initial state for prev_c
-end
-local init_state_global = clone_list(init_state)
-
-
 -- do fwd/bwd and return loss, grad_params
 local gridlstm = protos.rnn:findModules('nn.Grid2DLSTM')[1]
+local init_state_global
 
 function feval(x)
     if x ~= params then
@@ -211,7 +203,7 @@ function feval(x)
     local x, y = loader:next_batch(1)
     x,y = prepro(x,y)
     ------------------- forward pass -------------------
-    gridlstm.cells = {[0] = init_state_global}
+    if init_state_global then gridlstm.cells = {[0] = init_state_global} end
     local predictions = {}           -- softmax outputs
     local loss = 0
     protos.rnn:training()
