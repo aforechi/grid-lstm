@@ -189,8 +189,48 @@ function prepro(x,y)
 end
 
 
--- do fwd/bwd and return loss, grad_params
 local gridlstm = protos.rnn:findModules('nn.Grid2DLSTM')[1]
+
+-- evaluate the loss over an entire split
+function eval_split(split_index, max_batches)
+    print('evaluating loss over split index ' .. split_index)
+    local n = loader.split_sizes[split_index]
+    if max_batches ~= nil then n = math.min(max_batches, n) end
+
+    loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
+    local loss = 0
+    local accy = 0
+    local normal = 0
+    local init_state = nil
+
+    for i = 1,n do -- iterate over batches in the split
+        -- fetch a batch
+        local x, y = loader:next_batch(split_index)
+        x,y = prepro(x,y)
+        if init_state then gridlstm.userPrevCell = init_state end
+        -- forward pass
+        for t=1,opt.seq_length do
+            protos.rnn:evaluate() -- for dropout proper functioning
+            local prediction = protos.rnn:forward(x[t])
+            loss = loss + protos.criterion:forward(prediction, y[t])
+        end
+
+        -- carry over lstm state
+        init_state = gridlstm.cells[#gridlstm.cells]
+        print(i .. '/' .. n .. '...')
+    end
+
+    local out
+    if opt.task == "addition" then
+        out = accy / normal
+    else
+        out = loss / opt.seq_length / n
+    end
+
+    return out
+end
+
+-- do fwd/bwd and return loss, grad_params
 local init_state_global
 
 function feval(x)
